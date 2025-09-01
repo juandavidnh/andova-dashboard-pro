@@ -1,25 +1,110 @@
 
-import os
-import time
-from typing import Optional, Dict
+import os, time, warnings, requests, pytz
+from typing import Optional, Dict, Tuple, List
 from datetime import date, datetime
-
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-import yfinance as yf
-import requests
-import pytz
 
-st.set_page_config(page_title="Índice Portafolio (estilo Apple Stocks)", layout="wide")
+warnings.filterwarnings("ignore")
+st.set_page_config(page_title="ANDOVA — Portfolio Dashboard", layout="wide")
 
-# --------- Parámetros ---------
-ANCHOR_DATE = pd.Timestamp("2025-08-01")   # valor=1000 en esta fecha (o primer hábil ≥)
+# --------------------------
+# Configuración general
+# --------------------------
+ANCHOR_DATE = pd.Timestamp("2025-08-01")
 ANCHOR_VALUE = 1000.0
 US_EASTERN = pytz.timezone("US/Eastern")
 
-# --------- Utilidades ---------
+# --------------------------
+# Utilidades de tiempo
+# --------------------------
+def to_index_tz(ts, index: pd.DatetimeIndex) -> pd.Timestamp:
+    t = pd.Timestamp(ts)
+    idx_tz = getattr(index, "tz", None)
+    if idx_tz is None:
+        return t.tz_localize(None) if t.tzinfo is not None else t
+    return t.tz_localize(idx_tz) if t.tzinfo is None else t.tz_convert(idx_tz)
+
+# --------------------------
+# Yahoo helpers
+# --------------------------
+@st.cache_data(show_spinner=False, ttl=20)
+def yahoo_market_state(symbol: str = "QQQ") -> str:
+    """
+    Devuelve 'REGULAR' | 'PRE' | 'POST' | 'CLOSED' desde Quote.
+    Usamos una sola fuente de verdad para evitar errores en feriados.
+    """
+    try:
+        url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={symbol}"
+        r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=6)
+        if r.status_code == 200:
+            res = r.json().get("quoteResponse", {}).get("result", [])
+            if res:
+                return (res[0].get("marketState") or "CLOSED").upper()
+    except Exception:
+        pass
+    return "CLOSED"
+
+@st.cache_data(ttl=10, show_spinner=False)
+def yahoo_intraday_last(symbol: str):
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=1d&interval=1m&includePrePost=true"
+    try:
+        r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=7)
+        if r.status_code != 200: return None, None, None
+        j = r.json(); res = (j.get("chart",{}) or {}).get("result", [])
+        if not res: return None, None, None
+        res0 = res[0]; ts = res0.get("timestamp") or []
+        idx = pd.to_datetime(ts, unit="s", utc=True) if ts else None
+        q0 = (res0.get("indicators", {}) or {}).get("quote", [{}])[0]; closes = q0.get("close") or []
+        px, tstamp = None, None
+        for i in range(len(closes)-1, -1, -1):
+            if closes[i] is not None:
+                px = float(closes[i]); tstamp = idx[i] if idx is not None and i < len(idx) else None; break
+        pc = (res0.get("meta", {}) or {}).get("previousClose"); pc = float(pc) if pc is not None else None
+        return px, pc, tstamp
+    except Exception:
+        return None, None, None
+
+@st.cache_data(ttl=5, show_spinner=False)
+def yahoo_batch_quotes(symbols: List[str]) -> Tuple[Dict[str, float], Dict[str, float], Dict[str, Optional[pd.Timestamp]]]:
+    prices, prev_closes, ts_map = {}, {}, {}
+    if not symbols: return prices, prev_closes, ts_map
+    chunk = 40; missing=set()
+    for i in range(0, len(symbols), chunk):
+        syms = symbols[i:i+chunk]
+        url = "https://query1.finance.yahoo.com/v7/finance/quote?symbols=" + ",".join(syms)
+        try:
+            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=6)
+            if r.status_code == 200:
+                data = r.json().get("quoteResponse", {}).get("result", [])
+                got=set()
+                for q in data:
+                    s=str(q.get("symbol")); got.add(s)
+                    px=q.get("regularMarketPrice") or q.get("postMarketPrice")
+                    pc=q.get("regularMarketPreviousClose")
+                    t=q.get("regularMarketTime") or q.get("postMarketTime")
+                    ts=pd.to_datetime(t, unit="s", utc=True) if t else None
+                    if px is not None: prices[s]=float(px)
+                    if pc is not None: prev_closes[s]=float(pc)
+                    ts_map[s]=ts
+                for s in syms:
+                    if s not in got: missing.add(s)
+            else:
+                missing.update(syms)
+        except Exception:
+            missing.update(syms)
+    for s in sorted(missing):
+        px, pc, ts = yahoo_intraday_last(s)
+        if px is not None: prices[s]=px
+        if pc is not None and s not in prev_closes: prev_closes[s]=pc
+        if ts is not None: ts_map[s]=ts
+    return prices, prev_closes, ts_map
+
+# --------------------------
+# Datos y precios
+# --------------------------
 @st.cache_data(show_spinner=False, ttl=3600)
 def load_weights(path: str = "weights.csv") -> pd.Series:
     df = pd.read_csv(path)
@@ -28,16 +113,44 @@ def load_weights(path: str = "weights.csv") -> pd.Series:
     return s / s.sum()
 
 @st.cache_data(show_spinner=True, ttl=600)
-def download_prices(tickers, start, end):
-    df = yf.download(tickers, start=start, end=end, auto_adjust=True, progress=False)
-    if isinstance(df.columns, pd.MultiIndex):
-        prices = df["Close"].copy()
-    else:
-        prices = df[["Close"]].copy()
-        prices.columns = [tickers[0]]
-    prices.columns = [c.split("=")[0] if isinstance(c, str) else c for c in prices.columns]
-    prices = prices.sort_index()
-    prices = prices.dropna(axis=1, how="all")
+def download_prices(tickers: List[str], start, end) -> pd.DataFrame:
+    def yahoo_chart_daily_series(ticker: str, start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> pd.DataFrame | None:
+        p1 = int(pd.Timestamp(start_dt).tz_localize("UTC").timestamp())
+        p2 = int(pd.Timestamp(end_dt).tz_localize("UTC").timestamp())
+        url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+               f"?period1={p1}&period2={p2}&interval=1d&events=split,div&includeAdjClose=true")
+        for _ in range(3):
+            try:
+                r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+                if r.status_code != 200: time.sleep(0.4); continue
+                j = r.json()
+                result = (j.get("chart", {}) or {}).get("result", [])
+                if not result: time.sleep(0.3); continue
+                res0 = result[0]; ts = res0.get("timestamp")
+                if not ts: time.sleep(0.3); continue
+                idx = pd.to_datetime(ts, unit="s", utc=True).tz_convert("US/Eastern").normalize()
+                ind = res0.get("indicators", {}) or {}
+                adj = ((ind.get("adjclose") or [{}])[0]).get("adjclose")
+                close = ((ind.get("quote") or [{}])[0]).get("close")
+                arr = adj if (adj and any(v is not None for v in adj)) else close
+                if not arr: time.sleep(0.3); continue
+                s = pd.Series(arr, index=idx, name=ticker, dtype="float64").dropna()
+                if s.empty: time.sleep(0.2); continue
+                return s.to_frame()
+            except Exception:
+                time.sleep(0.3)
+        return None
+
+    tickers = [t for t in dict.fromkeys(tickers) if isinstance(t, str)]
+    frames, failed = [], []
+    for t in tickers:
+        df = yahoo_chart_daily_series(t, pd.Timestamp(start), pd.Timestamp(end))
+        if df is not None and not df.empty: frames.append(df)
+        else: failed.append(t)
+    if not frames: return pd.DataFrame()
+    prices = pd.concat(frames, axis=1).sort_index()
+    prices = prices.loc[:, ~prices.columns.duplicated()].dropna(axis=1, how="all")
+    if failed: st.sidebar.warning("Sin datos tras reintentos (Yahoo REST): " + ", ".join(sorted(failed)))
     return prices
 
 def first_trading_on_or_after(index: pd.DatetimeIndex, target: pd.Timestamp):
@@ -46,23 +159,37 @@ def first_trading_on_or_after(index: pd.DatetimeIndex, target: pd.Timestamp):
 
 def rebalance_dates_semimonthly(prices: pd.DataFrame) -> set:
     idx = prices.index
-    if len(idx) == 0:
-        return set()
-    rdates = set(prices.resample("M").last().index)  # month-end
+    if len(idx) == 0: return set()
+    rdates = set(prices.resample("M").last().index)
     months = pd.period_range(idx[0], idx[-1], freq="M")
     for p in months:
         fifteenth = pd.Timestamp(p.year, p.month, 15)
+        fifteenth = to_index_tz(fifteenth, idx).normalize()
         cand = first_trading_on_or_after(idx, fifteenth)
         if cand is not None and cand.month == p.month:
             rdates.add(cand)
     return rdates
 
+# --------------------------
+# Simulación (rebalanceo al CIERRE DEL MISMO DÍA)
+# --------------------------
 def simulate_with_holdings_from_start(prices: pd.DataFrame, weights: pd.Series, start_value: float = 1.0):
-    """Simula desde el primer día disponible del rango, con rebalanceos 15/fin de mes."""
     tickers_avail = [t for t in weights.index if t in prices.columns]
-    P = prices[tickers_avail].copy().ffill().dropna(how="any")
-    if len(P) == 0:
-        raise ValueError("No hay suficientes datos tras el inicio para todos los tickers.")
+    if not tickers_avail: raise ValueError("No hay tickers disponibles.")
+    P = prices[tickers_avail].copy()
+
+    # Alineamos inicio: primer día donde todos los tickers tienen dato (ffill)
+    fvs = [P[c].first_valid_index() for c in P.columns if P[c].first_valid_index() is not None]
+    if not fvs: raise ValueError("No hay datos válidos.")
+    start_dt = max(fvs); P = P.loc[P.index >= start_dt].ffill()
+
+    cols_ok = [c for c in P.columns if P[c].notna().all()]
+    if not cols_ok: raise ValueError("No hay suficientes datos tras el inicio para todos los tickers.")
+    if set(cols_ok) != set(P.columns):
+        dropped_cols = sorted(set(P.columns) - set(cols_ok))
+        st.sidebar.warning("Excluidos por cobertura incompleta: " + ", ".join(dropped_cols))
+        P = P[cols_ok]
+
     w = (weights.loc[P.columns] / weights.loc[P.columns].sum()).copy()
     dates = P.index
     shares = (start_value * w / P.iloc[0]).values
@@ -70,239 +197,115 @@ def simulate_with_holdings_from_start(prices: pd.DataFrame, weights: pd.Series, 
 
     pv_list, shares_rows = [], []
     for d in dates:
-        shares_rows.append(pd.Series(shares, index=P.columns, name=d))
+        # PV al cierre de d con las shares vigentes DURANTE el día d
         v = float(np.dot(shares, P.loc[d].values))
-        pv_list.append(v)
+        # Rebalanceamos al CIERRE de d: nuevas shares aplican desde ya (después del cierre)
         if d in rdates:
             shares = (v * w / P.loc[d]).values
+        pv_list.append(v)
+        # Guardamos shares POST-rebalanceo del propio día d
+        shares_rows.append(pd.Series(shares, index=P.columns, name=d))
 
     pv_raw = pd.Series(pv_list, index=dates, name="pv_raw")
     shares_df = pd.DataFrame(shares_rows)
     return pv_raw, shares_df, P
 
 def normalize_to_anchor(pv_raw: pd.Series, anchor_date: pd.Timestamp, anchor_value: float):
-    if len(pv_raw) == 0:
-        return pv_raw, 1.0, None
-    idx = pv_raw.index
-    anchor = first_trading_on_or_after(idx, anchor_date)
-    if anchor is None:
-        anchor = idx[-1]
-    base_val = float(pv_raw.loc[anchor])
-    scale = anchor_value / base_val if (base_val and not np.isnan(base_val)) else 1.0
+    if len(pv_raw) == 0: return pv_raw, 1.0, None
+    idx = pv_raw.index; anchor_target = to_index_tz(anchor_date, idx).normalize()
+    pos = idx.searchsorted(anchor_target); anchor = idx[pos] if pos < len(idx) else idx[-1]
+    base_val = float(pv_raw.loc[anchor]); scale = anchor_value / base_val if (base_val and not np.isnan(base_val)) else 1.0
     return (pv_raw * scale).rename("pv"), scale, anchor
 
-# ---- Live quotes providers ----
-@st.cache_data(ttl=5, show_spinner=False)
-def yahoo_intraday_last_all(tickers) -> tuple[dict, Optional[pd.Timestamp]]:
-    """Último precio intradía (posible retraso ~15m) + timestamp común."""
-    out = {}
-    ts = None
-    try:
-        data = yf.download(tickers, period="1d", interval="1m", auto_adjust=True, progress=False)
-        if isinstance(data.columns, pd.MultiIndex):
-            if "Close" in data.columns.levels[0]:
-                close_df = data["Close"].dropna(how="all")
-                if not close_df.empty:
-                    last_row = close_df.iloc[-1]
-                    ts = last_row.name if hasattr(last_row, 'name') else None
-                    last = last_row.dropna()
-                    out = {str(k): float(v) for k, v in last.to_dict().items()}
-        else:
-            last_series = data["Close"].dropna()
-            if len(last_series) > 0:
-                ts = last_series.index[-1]
-                out[str(tickers[0])] = float(last_series.iloc[-1])
-    except Exception:
-        pass
-    return out, ts
-
-@st.cache_data(ttl=5, show_spinner=False)
-def finnhub_last_quote(symbol, token: Optional[str]):
-    try:
-        if not token:
-            return None, None, None
-        url = f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={token}"
-        r = requests.get(url, timeout=5)
-        if r.status_code == 200:
-            j = r.json()
-            if "c" in j and j["c"] not in (None, 0):
-                ts = j.get("t")
-                ts = pd.to_datetime(ts, unit="s", utc=True) if ts else None
-                return float(j["c"]), float(j.get("pc") or 0.0), ts
-    except Exception:
-        pass
-    return None, None, None
-
-def market_state(p_aligned: pd.DataFrame) -> str:
-    """Devuelve:
-    - 'postclose' SOLO si >=16:05 ET **y** ya existe barra diaria de HOY.
-    - 'open' durante sesión regular **o** en after-hours (~16:00–20:00 ET) **o** si no hay barra diaria de hoy pero ya pasó el cierre (para usar intradía).
-    - 'preopen' resto (antes de 9:30 o fines de semana/feriados).
+# --------------------------
+# Estado de mercado (feriados fijos a CLOSED)
+# --------------------------
+def market_state(P_aligned: pd.DataFrame) -> str:
     """
-    now_et = datetime.now(US_EASTERN)
-    weekday = now_et.weekday()  # 0=lunes ... 6=domingo
-    has_today = len(p_aligned.index) > 0 and p_aligned.index[-1].date() == now_et.date()
-
-    open_t = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
-    close_t = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
-    postclose_gate = now_et.replace(hour=16, minute=5, second=0, microsecond=0)
-    ah_end = now_et.replace(hour=20, minute=0, second=0, microsecond=0)
-
-    if has_today and now_et >= postclose_gate:
-        return "postclose"
-    # mercado abierto o after-hours, o bien no hay barra diaria de hoy y ya pasó el cierre
-    if weekday < 5 and (open_t <= now_et < ah_end or (now_et >= close_t and not has_today)):
+    Usa Yahoo marketState como fuente de verdad:
+    - REGULAR o POST -> 'open'   (permitimos live)
+    - PRE o CLOSED   -> 'preopen' (usar cierres)
+    """
+    ms = yahoo_market_state("QQQ")
+    if ms in ("REGULAR", "POST"):
         return "open"
-    return "preopen"""
+    return "preopen"
 
-def latest_price_vectors(P_aligned: pd.DataFrame, provider: str, token: Optional[str]):
-    """Regla + salidas extendidas:
-       - lp_used: último precio (cierre de hoy si postclose; live si open; cierre de ayer si preopen)
-       - pp_used: SIEMPRE cierre de ayer
-       - used: fuente por ticker
-       - state: estado de mercado
-       - ts_map: timestamp por ticker (o común)
-    """
-    state = market_state(P_aligned)
-    last_idx = P_aligned.index[-1]
-    today_et = datetime.now(US_EASTERN).date()
-    if last_idx.date() == today_et and len(P_aligned.index) >= 2:
-        yday_close = P_aligned.loc[P_aligned.index[-2]].copy()
-        today_close = P_aligned.loc[P_aligned.index[-1]].copy()
-        have_today = True
+def prev_trading_close(P_aligned: pd.DataFrame):
+    if P_aligned.empty: return None, None, False
+    idx=P_aligned.index; last_idx=idx[-1]; today_et=datetime.now(US_EASTERN).date()
+    if last_idx.date()==today_et and len(idx)>=2:
+        yday_close=P_aligned.iloc[-2].copy(); today_close=P_aligned.iloc[-1].copy(); have_today=True
     else:
-        yday_close = P_aligned.loc[P_aligned.index[-1]].copy()
-        today_close = None
-        have_today = False
+        yday_close=P_aligned.iloc[-1].copy(); today_close=None; have_today=False
+    return yday_close, today_close, have_today
 
-    used: Dict[str, str] = {}
-    ts_map: Dict[str, Optional[pd.Timestamp]] = {}
-
-    if state == "postclose" and have_today:
-        lp_used = today_close
-        pp_used = yday_close
-        ts_common = pd.Timestamp.combine(pd.Timestamp(today_et), pd.Timestamp('16:00').time()).tz_localize('US/Eastern')
-        for t in P_aligned.columns:
-            used[t] = "DailyClose"
-            ts_map[t] = ts_common
-    elif state == "open":
+def latest_price_vectors(P_aligned: pd.DataFrame):
+    state = market_state(P_aligned)
+    yday_close, today_close, have_today = prev_trading_close(P_aligned)
+    used: Dict[str, str] = {}; ts_map: Dict[str, Optional[pd.Timestamp]] = {}
+    symbols = list(P_aligned.columns)
+    if state=="open":
+        prices_y, pcs_y, ts_y = yahoo_batch_quotes(symbols)
         lp_used = yday_close.copy()
-        use_finnhub = provider.startswith("Finnhub") and bool(token)
-        if use_finnhub:
-            for t in P_aligned.columns:
-                px, pc, ts = finnhub_last_quote(t, token)
-                if px is not None:
-                    lp_used[t] = px
-                    used[t] = "Finnhub"
-                    ts_map[t] = ts
-                if pd.isna(yday_close.get(t)) and pc is not None:
-                    yday_close[t] = pc
-        else:
-            quotes, ts = yahoo_intraday_last_all(list(P_aligned.columns))
-            for t, v in quotes.items():
-                lp_used[t] = float(v)
-                used[t] = "Yahoo intraday"
-                ts_map[t] = ts
+        for t,v in prices_y.items():
+            if pd.notna(v): lp_used[t]=float(v); used[t]="Yahoo Quote/1m"; ts_map[t]=ts_y.get(t)
+        for t,pc in pcs_y.items():
+            if pd.isna(yday_close.get(t)): yday_close[t]=pc
         pp_used = yday_close
-    else:  # preopen
-        lp_used = yday_close
-        pp_used = yday_close
+    else:
+        # preopen/feriado: usa el cierre del último hábil
+        lp_used=yday_close; pp_used=yday_close
         ts_common = pd.Timestamp.combine(pd.Timestamp(yday_close.name), pd.Timestamp('16:00').time())
-        for t in P_aligned.columns:
-            used[t] = "DailyClose"
-            ts_map[t] = ts_common
-
+        for t in symbols: used[t]="DailyClose"; ts_map[t]=ts_common
     return lp_used, pp_used, used, state, ts_map
 
-def sector_exposures(weights: pd.Series, sector_df: pd.DataFrame) -> pd.DataFrame:
-    if sector_df is None or sector_df.empty:
-        return pd.DataFrame({"sector":["Unknown"], "weight":[1.0]})
-    df = pd.DataFrame({"ticker": weights.index, "weight": weights.values})
-    out = df.merge(sector_df, on="ticker", how="left")
-    out["sector"] = out["sector"].fillna("Unknown").replace("", "Unknown")
-    return out.groupby("sector", as_index=False)["weight"].sum().sort_values("weight", ascending=False)
-
-def download_bytes(df: pd.DataFrame):
-    return df.to_csv(index=True).encode("utf-8")
-
-def apply_timerange(series: pd.Series, mode: str):
-    if series.empty:
-        return series
-    end = series.index[-1]
-    if mode == "1D":
-        start = series.index[-2] if len(series) >= 2 else series.index[0]
-    elif mode == "1W":
-        start = end - pd.Timedelta(days=7)
-    elif mode == "1M":
-        start = end - pd.DateOffset(months=1)
-    elif mode == "3M":
-        start = end - pd.DateOffset(months=3)
-    elif mode == "6M":
-        start = end - pd.DateOffset(months=6)
-    elif mode == "YTD":
-        start = pd.Timestamp(year=end.year, month=1, day=1)
-    elif mode == "1Y":
-        start = end - pd.DateOffset(years=1)
-    elif mode == "2Y":
-        start = end - pd.DateOffset(years=2)
-    elif mode == "5Y":
-        start = end - pd.DateOffset(years=5)
-    else:  # MAX
-        start = series.index[0]
-    return series.loc[series.index >= start]
-
-# --------- Sidebar ---------
+# --------------------------
+# UI
+# --------------------------
 st.sidebar.title("🔧 Configuración")
-
 weights = load_weights()
-try:
-    sectors = pd.read_csv("sectors.csv")
-except Exception:
-    sectors = pd.DataFrame(columns=["ticker","sector"])
+try: sectors = pd.read_csv("sectors.csv")
+except Exception: sectors = pd.DataFrame(columns=["ticker","sector"])
 
 tickers_all = list(weights.index)
-selected = st.sidebar.multiselect("Filtra tickers (renormaliza pesos)", tickers_all, default=tickers_all)
-
+selected = st.sidebar.multiselect("Filtra tickers", tickers_all, default=tickers_all)
 default_start = date(2018,1,1)
-start = st.sidebar.date_input("Fecha inicio descarga (para ver <1000, usa antes del 2025-08-01)", default_start)
+start = st.sidebar.date_input("Fecha inicio descarga", default_start)
 end = st.sidebar.date_input("Fecha fin", date.today())
-
-show_dd = st.sidebar.checkbox("Mostrar drawdown", value=False)
-
-# Live options
 st.sidebar.markdown("---")
-st.sidebar.subheader("⚡ Actualización en vivo (opcional)")
+st.sidebar.subheader("⚡ Live")
+live_on = st.sidebar.checkbox("Activar live", value=True, key="live_on")
+refresh_sec = st.sidebar.number_input("Auto-refresh (segundos)", min_value=5, max_value=120, value=20, step=5)
 
-live_on = st.sidebar.checkbox("Activar live", value=st.session_state.get("live_on", True), key="live_on")
-provider = st.sidebar.selectbox("Proveedor", ["Yahoo (posible retraso ~15m)", "Finnhub (tiempo real)"])
-refresh_sec = st.sidebar.number_input("Auto-refresh (segundos)", min_value=5, max_value=120, value=15, step=5)
-
-# Finnhub key
-finnhub_key = None
-try:
-    finnhub_key = st.secrets.get("FINNHUB_API_KEY", None)
-except Exception:
-    finnhub_key = None
-if not finnhub_key:
-    finnhub_key = os.environ.get("FINNHUB_API_KEY")
-
-if provider.startswith("Finnhub") and live_on and not finnhub_key:
-    st.sidebar.warning("Configura FINNHUB_API_KEY en `st.secrets` o como variable de entorno para tiempo real.")
-
-# --------- Data & Sim ---------
 weights_sel = (weights.loc[selected] if selected else weights).copy()
 weights_sel = weights_sel / weights_sel.sum()
-
-st.sidebar.write("Pesos efectivos (normalizados):")
-st.sidebar.dataframe(pd.DataFrame({"weight": weights_sel}).style.format({"weight": "{:.2%}"}), use_container_width=True)
+st.sidebar.dataframe(pd.DataFrame({"weight": weights_sel}).style.format({"weight":"{:.2%}"}), use_container_width=True)
 
 prices = download_prices(list(weights_sel.index), start, end)
-missing = [t for t in weights_sel.index if t not in prices.columns]
-if missing:
-    st.sidebar.warning("Tickers omitidos por falta de datos: " + ", ".join(missing))
-    keep = [t for t in weights_sel.index if t in prices.columns]
-    if keep:
-        weights_sel = (weights_sel.loc[keep] / weights_sel.loc[keep].sum())
+if prices is None or prices.empty:
+    st.error("No hay datos para el rango seleccionado."); st.stop()
+
+# Forzamos ancla: quitamos tickers que no tienen historia hasta ANCHOR_DATE
+anchor_target = to_index_tz(ANCHOR_DATE, prices.index).normalize()
+eligible_cols = []; excluded_after_anchor = []
+for c in prices.columns:
+    fvi = prices[c].first_valid_index()
+    if fvi is not None and fvi <= anchor_target: eligible_cols.append(c)
+    else: excluded_after_anchor.append(c)
+if excluded_after_anchor:
+    st.sidebar.warning("Excluidos por no tener datos hasta el ancla: " + ", ".join(sorted(excluded_after_anchor)))
+    prices = prices[eligible_cols] if eligible_cols else prices
+
+weights_sel = weights_sel[[t for t in weights_sel.index if t in prices.columns]]
+weights_sel = weights_sel / weights_sel.sum()
+valid_cols = [c for c in prices.columns if prices[c].notna().sum() >= 2]
+removed_sparse = sorted(set(prices.columns) - set(valid_cols))
+if removed_sparse: st.sidebar.warning("Tickers sin suficientes datos: " + ", ".join(removed_sparse))
+prices = prices[valid_cols] if valid_cols else prices
+present = [t for t in weights_sel.index if t in prices.columns]
+if not present: st.error("Ningún ticker con datos."); st.stop()
+weights_sel = (weights_sel.loc[present] / weights_sel.loc[present].sum())
 
 st.title("📈 Índice del Portafolio — estilo Apple Stocks")
 
@@ -310,216 +313,227 @@ try:
     pv_raw, shares_df, P_aligned = simulate_with_holdings_from_start(prices, weights_sel, start_value=1.0)
     pv, scale_k, anchor_dt = normalize_to_anchor(pv_raw, ANCHOR_DATE, ANCHOR_VALUE)
 
-    # ---- Snapshot de precios para HOY siguiendo la regla ----
-    lp_used, pp_used, used_live, mkt_state, ts_map = latest_price_vectors(P_aligned, provider if live_on else "Yahoo", finnhub_key if live_on else None)
+    lp_used, pp_used, used_live, mkt_state, ts_map = latest_price_vectors(P_aligned)
 
-    # Persistir último snapshot válido para evitar vacíos por rate limits
-    if "last_live_lp" not in st.session_state:
-        st.session_state["last_live_lp"] = None
-        st.session_state["last_live_used"] = None
-        st.session_state["last_live_ts"] = None
-        st.session_state["last_live_date"] = None
+    # Para métricas del día: las shares vigentes DURANTE el día t son las del día anterior (porque guardamos post-rebalanceo)
+    shares_during = shares_df.shift(1)
 
-    # Guardar snapshot si viene válido
-    if live_on and used_live and len(lp_used.dropna()) > 0:
-        st.session_state["last_live_lp"] = lp_used.copy()
-        st.session_state["last_live_used"] = used_live.copy()
-        st.session_state["last_live_ts"] = ts_map.copy()
-        st.session_state["last_live_date"] = datetime.now(US_EASTERN).date()
-
-    # Reusar snapshot SOLO si es del mismo día calendario ET y estamos en open (incluye after-hours)
-    elif live_on and st.session_state.get("last_live_lp") is not None and (mkt_state == "open")         and st.session_state.get("last_live_date") == datetime.now(US_EASTERN).date():
-        lp_used = st.session_state["last_live_lp"].copy()
-        used_live = st.session_state["last_live_used"].copy()
-        ts_map = st.session_state["last_live_ts"].copy() if st.session_state["last_live_ts"] else {}
-
-    # ---- Top metric (último valor & cambio del día) ----
-    last_shares = shares_df.loc[P_aligned.index[-1]]
-    last_val = float(np.dot(last_shares.values, lp_used.values)) * scale_k if len(lp_used) else np.nan
-
+    last_idx = P_aligned.index[-1]
+    last_shares_for_today = shares_during.loc[last_idx] if last_idx in shares_during.index else shares_df.iloc[0]
+    last_val = float(np.dot(last_shares_for_today.values, lp_used.values)) * scale_k if len(lp_used) else np.nan
     delta_str = "n/a"
-    live_badge = ""
     if pp_used is not None and (pp_used != 0).all():
-        prev_val = float(np.dot(last_shares.values, pp_used.values)) * scale_k
-        if prev_val:
-            delta_str = f"{((last_val / prev_val) - 1.0) * 100.0:.2f}%"
+        prev_val = float(np.dot(last_shares_for_today.values, pp_used.values)) * scale_k
+        if prev_val: delta_str = f"{((last_val/prev_val)-1.0)*100.0:.2f}%"
+
+    # Etiqueta LIVE / feriado
+    ms = yahoo_market_state("QQQ")
+    weekday = datetime.now(US_EASTERN).weekday()
+    live_badge = ""
     if live_on and mkt_state == "open":
         live_badge = " (LIVE)"
-    elif mkt_state == "postclose":
-        live_badge = " (Cierre HOY)"
+    elif ms == "CLOSED" and weekday < 5:
+        live_badge = " (FERIADO)"
+    else:
+        live_badge = " (Cierre HOY)" if mkt_state != "open" else live_badge
 
-    col1, col2, col3 = st.columns([1.5, 1, 1])
+    col1, col2, col3 = st.columns([1.6,1,1])
     with col1:
-        st.metric(f"Índice normalizado a 1.000 en 2025-08-01 — último {'snapshot' if mkt_state=='open' else 'cierre'}{live_badge}", f"{last_val:,.2f}", delta=delta_str)
+        st.metric(f"Índice normalizado a 1.000 en 2025-08-01 — {'snapshot' if mkt_state=='open' else 'último cierre'}{live_badge}",
+                  f"{last_val:,.2f}", delta=delta_str)
         if anchor_dt is not None:
-            st.caption(f"Anclado a {ANCHOR_VALUE:,.0f} el {anchor_dt.date().isoformat()} (o primer hábil ≥ 2025-08-01).")
-        if used_live:
-            st.caption("Precios recientes utilizados para: " + ", ".join(sorted(used_live.keys())))
-        st.caption(f"Estado de mercado: {mkt_state} • Hora ET: {datetime.now(US_EASTERN).strftime('%Y-%m-%d %H:%M:%S')}")
+            st.caption(f"Anclado a 1,000 el {anchor_dt.date().isoformat()} (o primer hábil ≥ 2025-08-01).")
+        if used_live: st.caption("Precios recientes utilizados para: " + ", ".join(sorted(used_live.keys())))
+        st.caption(f"Estado de mercado: {mkt_state} • marketState={ms} • Hora ET: {datetime.now(US_EASTERN).strftime('%Y-%m-%d %H:%M:%S')}")
 
-    # ---- Selector de rango (estilo Apple) ----
-    ranges = ["1D", "1W", "1M", "3M", "6M", "YTD", "1Y", "2Y", "5Y", "MAX"]
+    @st.cache_data(ttl=20, show_spinner=False)
+    def yahoo_quote_rest(symbol: str):
+        url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={symbol}"
+        try:
+            r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=6)
+            if r.status_code == 200:
+                data = r.json(); q = data.get("quoteResponse", {}).get("result", [])
+                if q:
+                    q=q[0]; px=q.get("regularMarketPrice") or q.get("postMarketPrice")
+                    pc=q.get("regularMarketPreviousClose")
+                    ts=q.get("regularMarketTime") or q.get("postMarketTime")
+                    ts=pd.to_datetime(ts, unit="s", utc=True) if ts else None
+                    if px and pc: return float(px), float(pc), ts, "Yahoo Quote"
+        except Exception:
+            pass
+        return None, None, None, None
+
+    def qqq_day_return():
+        px, pc, ts, src = yahoo_quote_rest("QQQ")
+        if px is not None and pc not in (None, 0): return (px/pc-1.0)*100.0, src, ts
+        px2, pc2, ts2 = yahoo_intraday_last("QQQ")
+        if px2 is not None and pc2 not in (None, 0): return (px2/pc2-1.0)*100.0, "Yahoo Chart 1m", ts2
+        return None, "N/A", None
+
+    with col2:
+        qqq_ret, q_src, q_ts = qqq_day_return()
+        if qqq_ret is not None:
+            st.metric("QQQ (día)", f"{qqq_ret:.2f}%"); st.caption(f"Fuente: {q_src}" + (f" • {q_ts}" if q_ts is not None else ""))
+        else: st.metric("QQQ (día)", "n/a")
+
+    # ----- Gráfico índice -------
+    ranges = ["1D","1W","1M","3M","6M","YTD","1Y","2Y","5Y","MAX"]
     sel = st.radio("Rango", options=ranges, index=ranges.index("6M"), horizontal=True)
-    pv_disp = apply_timerange(pv, sel)
-
-    # Si abierto, añadimos snapshot como último punto virtual (sin alterar histórico)
-    if live_on and mkt_state == "open" and len(pv_disp) > 0:
-        pv_disp = pd.concat([pv_disp, pd.Series([last_val], index=[pv_disp.index[-1] + pd.Timedelta(seconds=1)])])
-
-    # Variación en el rango
-    range_delta_abs, range_delta_pct = None, None
-    if len(pv_disp) >= 2:
-        range_delta_abs = pv_disp.iloc[-1] - pv_disp.iloc[0]
-        range_delta_pct = (pv_disp.iloc[-1] / pv_disp.iloc[0] - 1.0) * 100.0
-
-    # Gráfico principal (área verde/roja)
-    color = "green" if (range_delta_abs is None or range_delta_abs >= 0) else "red"
-    chart_df = pv_disp.rename("Índice").to_frame()
-    fig = px.area(chart_df, x=chart_df.index, y="Índice")
-    fig.update_traces(line_color=color, fillcolor=color, opacity=0.25)
-    fig.update_layout(margin=dict(l=0, r=0, t=10, b=0), showlegend=False, xaxis_title="", yaxis_title="")
+    pv_disp = pv.copy(); end_idx = pv_disp.index[-1]
+    if sel=="1D": start_idx = pv_disp.index[-2] if len(pv_disp)>=2 else pv_disp.index[0]
+    elif sel=="1W": start_idx = end_idx - pd.Timedelta(days=7)
+    elif sel=="1M": start_idx = end_idx - pd.DateOffset(months=1)
+    elif sel=="3M": start_idx = end_idx - pd.DateOffset(months=3)
+    elif sel=="6M": start_idx = end_idx - pd.DateOffset(months=6)
+    elif sel=="YTD": start_idx = pd.Timestamp(year=end_idx.year, month=1, day=1, tz=end_idx.tz)
+    elif sel=="1Y": start_idx = end_idx - pd.DateOffset(years=1)
+    elif sel=="2Y": start_idx = end_idx - pd.DateOffset(years=2)
+    elif sel=="5Y": start_idx = end_idx - pd.DateOffset(years=5)
+    else: start_idx = pv_disp.index[0]
+    pv_disp = pv_disp.loc[pv_disp.index>=start_idx]
+    if live_on and mkt_state=="open" and len(pv_disp)>0:
+        now_idx = to_index_tz(datetime.now(US_EASTERN), pv_disp.index)
+        pv_disp = pd.concat([pv_disp, pd.Series([last_val], index=[now_idx])])
+    if len(pv_disp)>=2:
+        range_delta_abs = pv_disp.iloc[-1]-pv_disp.iloc[0]; range_delta_pct=(pv_disp.iloc[-1]/pv_disp.iloc[0]-1.0)*100.0
+    else: range_delta_abs, range_delta_pct = None, None
+    color="green" if (range_delta_abs is None or range_delta_abs>=0) else "red"
+    chart_df = pv_disp.rename("Índice").to_frame(); fig = px.area(chart_df, x=chart_df.index, y="Índice")
+    fig.update_traces(line_color=color, fillcolor=color, opacity=0.25); fig.update_layout(margin=dict(l=0,r=0,t=10,b=0), showlegend=False, xaxis_title="", yaxis_title="")
     st.plotly_chart(fig, use_container_width=True)
-
     if range_delta_abs is not None:
-        sign = "▲" if range_delta_abs >= 0 else "▼"
-        st.caption(f"{sign} {range_delta_abs:,.2f} puntos ({range_delta_pct:.2f}%) en {sel}{' • LIVE' if (live_on and mkt_state=='open') else ''}")
+        sign="▲" if range_delta_abs>=0 else "▼"; st.caption(f"{sign} {range_delta_abs:,.2f} puntos ({range_delta_pct:.2f}%) en {sel}{' • LIVE' if (live_on and mkt_state=='open') else ''}")
 
-    # ---- Tabs (Métricas / Exposición / Datos / Breakdown) ----
-    tab1, tab2, tab3, tab4 = st.tabs(["Métricas", "Exposición", "Datos", "Breakdown"])
+    tab1, tab2, tab3, tab4 = st.tabs(["Métricas","Exposición","Datos","Breakdown"])
 
+    # ----- Métricas -----
     with tab1:
         st.subheader("Métricas (serie normalizada)")
         def perf_stats(series: pd.Series) -> dict:
-            s = series.dropna()
-            r = s.pct_change().dropna()
-            if len(r) == 0:
-                return {"CAGR": np.nan, "Vol anual": np.nan, "Max DD": np.nan, "Sharpe~": np.nan}
-            years = (s.index[-1] - s.index[0]).days / 365.25
-            cagr = (s.iloc[-1] / s.iloc[0]) ** (1/years) - 1 if years > 0 else np.nan
-            vol = r.std() * np.sqrt(252)
-            dd = (s / s.cummax() - 1.0).min()
-            sharpe = cagr / vol if (vol and vol > 0) else np.nan
-            return {"CAGR": cagr, "Vol anual": vol, "Max DD": dd, "Sharpe~": sharpe}
-        stats = perf_stats(pv)
-        fmt = {
-            "CAGR": f"{stats['CAGR']:.2%}" if pd.notna(stats['CAGR']) else "n/a",
-            "Vol anual": f"{stats['Vol anual']:.2%}" if pd.notna(stats['Vol anual']) else "n/a",
-            "Max DD": f"{stats['Max DD']:.2%}" if pd.notna(stats['Max DD']) else "n/a",
-            "Sharpe~": f"{stats['Sharpe~']:.2f}" if pd.notna(stats['Sharpe~']) else "n/a"
-        }
+            s=series.dropna(); r=s.pct_change().dropna()
+            if len(r)==0: return {"CAGR":np.nan,"Vol anual":np.nan,"Max DD":np.nan,"Sharpe~":np.nan}
+            years=(s.index[-1]-s.index[0]).days/365.25
+            cagr=(s.iloc[-1]/s.iloc[0])**(1/years)-1 if years>0 else np.nan
+            vol=r.std()*np.sqrt(252); dd=(s/s.cummax()-1.0).min(); sharpe=cagr/vol if (vol and vol>0) else np.nan
+            return {"CAGR":cagr,"Vol anual":vol,"Max DD":dd,"Sharpe~":sharpe}
+        stats=perf_stats(pv)
+        fmt={"CAGR": f"{stats['CAGR']:.2%}" if pd.notna(stats['CAGR']) else "n/a",
+             "Vol anual": f"{stats['Vol anual']:.2%}" if pd.notna(stats['Vol anual']) else "n/a",
+             "Max DD": f"{stats['Max DD']:.2%}" if pd.notna(stats['Max DD']) else "n/a",
+             "Sharpe~": f"{stats['Sharpe~']:.2f}" if pd.notna(stats['Sharpe~']) else "n/a"}
         st.dataframe(pd.DataFrame(fmt, index=["Índice"]).T, use_container_width=True)
 
+    # ----- Exposición por sector -----
     with tab2:
         st.subheader("Exposición por sector (pesos objetivo)")
-        expos = sector_exposures(weights_sel, sectors)
-        fig2 = px.bar(expos, x="sector", y="weight", labels={"weight": "Peso"})
-        st.plotly_chart(fig2, use_container_width=True)
-        st.dataframe(expos.style.format({"weight": "{:.2%}"}), use_container_width=True)
+        st.caption("Puedes editar 'sectors.csv' (ticker,sector).")
+        def _clean_secs_df(df):
+            df=df.copy()
+            if "ticker" in df.columns: df["ticker"]=df["ticker"].astype(str).str.strip().str.upper()
+            if "sector" in df.columns: df["sector"]=df["sector"].fillna("").astype(str).str.strip()
+            return df.drop_duplicates(subset=["ticker"], keep="first")
+        sec = sectors.copy() if "sectors" in globals() else pd.DataFrame(columns=["ticker","sector"])
+        sec = _clean_secs_df(sec)
+        expos = pd.DataFrame({"ticker":[t.strip().upper() for t in weights_sel.index], "weight":weights_sel.values})
+        out = expos.merge(sec, on="ticker", how="left"); out["sector"]=out["sector"].fillna("").replace("","Unknown")
+        expos2=out.groupby("sector", as_index=False)["weight"].sum().sort_values("weight", ascending=False)
+        fig2=px.bar(expos2, x="sector", y="weight", labels={"weight":"Peso"}); st.plotly_chart(fig2, use_container_width=True)
+        st.dataframe(expos2.style.format({"weight":"{:.2%}"}), use_container_width=True)
 
+    # ----- Datos base -----
     with tab3:
-        st.subheader("Series base (diarias, Yahoo)")
-        st.dataframe(P_aligned.ffill().tail(200), use_container_width=True)
-        st.download_button("Descargar precios CSV", data=P_aligned.ffill().to_csv().encode("utf-8"), file_name="prices.csv", mime="text/csv")
-        out = pd.DataFrame({"pv_normalizada": pv})
-        st.download_button("Descargar índice CSV", data=out.to_csv().encode("utf-8"), file_name="index_values.csv", mime="text/csv")
+        st.subheader("Series base (precios) — diario + snapshot de hoy si LIVE")
+        P_show=P_aligned.ffill().copy()
+        if live_on and mkt_state=="open":
+            now_idx2 = to_index_tz(datetime.now(US_EASTERN), P_show.index); P_show.loc[now_idx2]=lp_used; P_show=P_show.sort_index()
+        st.dataframe(P_show.tail(200), use_container_width=True)
+        st.download_button("Descargar precios CSV", data=P_show.to_csv().encode("utf-8"), file_name="prices.csv", mime="text/csv")
+        out_idx = pd.DataFrame({"pv_normalizada": pv})
+        st.download_button("Descargar índice CSV", data=out_idx.to_csv().encode("utf-8"), file_name="index_values.csv", mime="text/csv")
 
+    # ----- Breakdown -----
     with tab4:
-        st.subheader("Breakdown de cambios por ticker (con fuente y timestamp)")
-        st.caption("Regla: cierre de hoy si ya cerró; si abierto → precio LIVE; si no abrió → cierre de ayer. `precio_prev` SIEMPRE = cierre de ayer.")
+        st.subheader("Breakdown de cambios por ticker (con fuente, timestamp y peso actual)")
+        st.caption("Regla: feriados y fines de semana → cierre del día hábil anterior.")
 
-        if len(P_aligned) >= 2:
-            d_last = P_aligned.index[-1]
-            d_prev = P_aligned.index[-2]
-            px_last = lp_used.copy()                   # último precio según regla
-            px_prev = pp_used.copy()                   # siempre cierre de ayer
+        if len(P_aligned)>=2:
+            d_last=P_aligned.index[-1]
+            # Shares vigentes DURANTE el último día:
+            shares_today = shares_during.loc[d_last] if d_last in shares_during.index else shares_df.iloc[0]
+            px_last=lp_used.copy(); px_prev=pp_used.copy()
+            dP=px_last-px_prev
+            abs_contrib=(shares_today*dP)*scale_k; idx_move=abs_contrib.sum()
+            pct_move=(px_last/px_prev-1.0).rename("ret_%")
+            pos_vals=(shares_df.loc[d_last]*px_last)*scale_k  # peso actual al cierre/snapshot con shares POST-rebalanceo
+            total_val=pos_vals.sum()
+            peso_actual=(pos_vals/total_val)*100.0 if total_val!=0 else pd.Series(np.nan, index=pos_vals.index)
 
-            shares_today = shares_df.loc[d_last]       # shares del último día histórico
-
-            dP = px_last - px_prev
-            abs_contrib = (shares_today * dP) * scale_k
-            idx_move = abs_contrib.sum()
-            pct_move = (px_last / px_prev - 1.0).rename("ret_%")
-
-            # Fuente y timestamp por ticker
-            fuente_series = pd.Series({t: used_live.get(t, 'DailyClose') for t in px_last.index})
-            ts_series = pd.Series({t: ts_map.get(t) for t in px_last.index})
-
-            last_day_df = pd.DataFrame({
-                "precio_prev": px_prev,
-                "precio_ult": px_last,
-                "ret_%": pct_move * 100.0,
-                "contrib_abs_puntos": abs_contrib,
-                "contrib_%_del_mov_indice": (abs_contrib / idx_move * 100.0) if idx_move != 0 else np.nan,
-                "fuente": fuente_series,
-                "snapshot_ts": ts_series
+            fuente_series=pd.Series({t: used_live.get(t,'DailyClose') for t in px_last.index})
+            ts_series=pd.Series({t: ts_map.get(t) for t in px_last.index})
+            last_day_df=pd.DataFrame({
+                "precio_prev":px_prev,"precio_ult":px_last,"ret_%":pct_move*100.0,
+                "contrib_abs_puntos":abs_contrib,
+                "contrib_%_del_mov_indice":(abs_contrib/idx_move*100.0) if idx_move!=0 else np.nan,
+                "peso_actual":peso_actual,"fuente":fuente_series,"snapshot_ts":ts_series
             }).sort_values("contrib_abs_puntos", ascending=False)
-
             st.markdown("**Último día / snapshot**")
             st.dataframe(last_day_df.style.format({
-                "precio_prev": "{:.2f}", "precio_ult": "{:.2f}", "ret_%": "{:.2f}%",
-                "contrib_abs_puntos": "{:.2f}", "contrib_%_del_mov_indice": "{:.2f}%"
+                "precio_prev":"{:.2f}","precio_ult":"{:.2f}","ret_%":"{:.2f}%",
+                "contrib_abs_puntos":"{:.2f}","contrib_%_del_mov_indice":"{:.2f}%","peso_actual":"{:.2f}%"
             }), use_container_width=True)
-            fig_ld = px.bar(last_day_df.reset_index().rename(columns={"index": "ticker"}),
-                            x="ticker", y="contrib_abs_puntos", title="Contribución absoluta (puntos) — último día/snapshot")
+            fig_ld=px.bar(last_day_df.reset_index().rename(columns={"index":"ticker"}), x="ticker", y="contrib_abs_puntos", title="Contribución absoluta (puntos) — último día/snapshot")
             st.plotly_chart(fig_ld, use_container_width=True)
         else:
             st.warning("No hay suficientes datos para el breakdown del último día.")
 
-        # Rango (según selector superior)
-        pv_r = apply_timerange(pv, sel)
-        if len(pv_r) < 2:
-            st.warning("Rango demasiado corto.")
+        # Rango
+        pv_r=pv_disp.copy()
+        if len(pv_r)<2: st.warning("Rango demasiado corto.")
         else:
-            start_ts = pv_r.index[0]
-            end_ts = pv_r.index[-1]
-            idx = P_aligned.index
-            start_pos = idx.searchsorted(start_ts)
-            end_pos = idx.searchsorted(end_ts, side="right") - 1
-            if end_pos <= start_pos:
-                st.warning("Rango demasiado corto para breakdown.")
+            idx_all=P_aligned.index; start_ts=pv_disp.index[0]; end_ts=pv_disp.index[-1]
+            start_pos=idx_all.searchsorted(start_ts); end_pos=idx_all.searchsorted(end_ts, side="right")-1
+            if end_pos<=start_pos: st.warning("Rango demasiado corto para breakdown.")
             else:
-                contrib = pd.Series(0.0, index=P_aligned.columns)
-                for i in range(start_pos, end_pos + 1):
-                    d_i = idx[i]
-                    d_prev_i = idx[i - 1]
-                    dP_i = P_aligned.loc[d_i] - P_aligned.loc[d_prev_i]
-                    shares_i = shares_df.loc[d_i]
-                    contrib = contrib.add(shares_i * dP_i, fill_value=0.0)
+                contrib=pd.Series(0.0, index=P_aligned.columns)
+                for i in range(start_pos+1, end_pos+1):
+                    d_i=idx_all[i]; d_prev_i=idx_all[i-1]
+                    dP_i=P_aligned.loc[d_i]-P_aligned.loc[d_prev_i]
+                    shares_i=shares_during.loc[d_i]  # shares vigentes DURANTE el día i
+                    contrib=contrib.add(shares_i*dP_i, fill_value=0.0)
+                # Si LIVE, añadimos el tramo intradía desde el último cierre al snapshot
+                if live_on and mkt_state=="open":
+                    last_daily_close_prices=P_aligned.loc[P_aligned.index[-1]]
+                    intraday_move=lp_used-last_daily_close_prices
+                    shares_today2=shares_during.loc[P_aligned.index[-1]]
+                    contrib=contrib.add(shares_today2*intraday_move, fill_value=0.0)
+                contrib=contrib*scale_k; total_pts=contrib.sum()
 
-                # Ajuste intradía si abierto: añade tramo (LIVE - cierre más reciente)
-                if live_on and mkt_state == "open":
-                    last_daily_close_prices = P_aligned.loc[P_aligned.index[-1]]
-                    intraday_move = lp_used - last_daily_close_prices
-                    shares_today2 = shares_df.loc[P_aligned.index[-1]]
-                    contrib = contrib.add(shares_today2 * intraday_move, fill_value=0.0)
+                base_prices=P_aligned.loc[idx_all[start_pos]]
+                end_prices=(lp_used if (live_on and mkt_state=="open") else P_aligned.loc[idx_all[end_pos]])
+                ret_range_pct=(end_prices/base_prices-1.0)*100.0
 
-                contrib = contrib * scale_k
-                total_pts = contrib.sum()
-                base_prices = P_aligned.loc[idx[start_pos - 1]]
-                end_prices = P_aligned.loc[idx[end_pos]]
-                ret_range_pct = (end_prices / base_prices - 1.0) * 100.0
+                shares_end=shares_df.loc[idx_all[end_pos]]
+                pos_vals_end=(shares_end*end_prices)*scale_k; total_end=pos_vals_end.sum()
+                peso_actual_rango=(pos_vals_end/total_end)*100.0 if total_end!=0 else pd.Series(np.nan, index=pos_vals_end.index)
 
-                range_df = pd.DataFrame({
-                    "ret_%_rango": ret_range_pct,
-                    "contrib_abs_puntos": contrib,
-                    "contrib_%_del_mov_indice": (contrib / total_pts * 100.0) if total_pts != 0 else np.nan
+                range_df=pd.DataFrame({
+                    "ret_%_rango":ret_range_pct,
+                    "contrib_abs_puntos":contrib,
+                    "contrib_%_del_mov_indice":(contrib/total_pts*100.0) if total_pts!=0 else np.nan,
+                    "peso_actual_fin_rango":peso_actual_rango
                 }).sort_values("contrib_abs_puntos", ascending=False)
 
                 st.dataframe(range_df.style.format({
-                    "ret_%_rango": "{:.2f}%",
-                    "contrib_abs_puntos": "{:.2f}",
-                    "contrib_%_del_mov_indice": "{:.2f}%"
+                    "ret_%_rango":"{:.2f}%","contrib_abs_puntos":"{:.2f}",
+                    "contrib_%_del_mov_indice":"{:.2f}%","peso_actual_fin_rango":"{:.2f}%"
                 }), use_container_width=True)
-                fig_rg = px.bar(range_df.reset_index().rename(columns={"index": "ticker"}),
-                                x="ticker", y="contrib_abs_puntos", title="Contribución absoluta (puntos) — rango")
+                fig_rg=px.bar(range_df.reset_index().rename(columns={"index":"ticker"}), x="ticker", y="contrib_abs_puntos", title="Contribución absoluta (puntos) — rango")
                 st.plotly_chart(fig_rg, use_container_width=True)
 
-    st.info("Regla aplicada: cierre de hoy si ya cerró; si abierto → LIVE; si no abrió → cierre de ayer. `precio_prev` SIEMPRE = cierre de ayer.")
+    st.info("Feriados y fines de semana: estado 'preopen' (no LIVE) gracias a marketState de Yahoo. Rebalanceo al CIERRE del día (15 y último hábil).")
 
-    # ---- Auto-refresh (no recarga el navegador) ----
-    if live_on and refresh_sec and mkt_state == "open":
-        time.sleep(int(refresh_sec))
-        st.rerun()
+    if live_on and refresh_sec and mkt_state=="open":
+        time.sleep(int(refresh_sec)); st.rerun()
 
 except Exception as e:
     st.error(f"Error: {e}")

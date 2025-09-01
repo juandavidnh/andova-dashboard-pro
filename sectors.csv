@@ -1,56 +1,56 @@
 ticker,sector
-AAPL,Consumer Electronics
-ACHR,eVTOL
-ADBE,
-ALAB,Semiconductor IP
-AMBA,Semiconductors
-AMD,Semiconductors
-AMZN,Internet Retail
-ARM,Semiconductors
-ASML,Semiconductor Equipment
-AVGO,Semiconductors
-BE,Hydrogen
-CEG,
-CRDO,Networking
-CRWD,Cybersecurity
-DDOG,Software
-DNA,SynBio
-EH,eVTOL
-FLNC,Energy Storage
-GOOG,Internet Content
-GOOGL,Internet Content
-GRAL,
-HIMS,Digital Health
-INTU,Software
-IONQ,Quantum
-JOBY,eVTOL
-MBLY,Autonomous Driving
-MDB,Software
-MELI,E-commerce
-META,Interactive Media
-MRVL,Semiconductors
-MSFT,Software
-MU,Semiconductors
-NFLX,Streaming
-NVDA,Semiconductors
-ON,Semiconductors
-OUST,Lidar
-PANW,Cybersecurity
-PLTR,Software
-QBTS,Quantum
-QCOM,Semiconductors
-QS,Batteries
-RGTI,Quantum
-S,Cybersecurity
-SDGR,Computational Chemistry
-SLDP,Batteries
-SNPS,Software
-STEM,Energy Storage
-SYM,Robotics
-TEM,AI/Healthcare
-TLX,
-TSLA,Automobiles
-TSM,Semiconductors
-VKTX,Biotech
+AAPL,Information Technology
+ACHR,Industrials
+ADBE,Information Technology
+ALAB,Information Technology
+AMBA,Information Technology
+AMD,Information Technology
+AMZN,Consumer Discretionary
+ARM,Information Technology
+ASML,Information Technology
+AVGO,Information Technology
+BE,Industrials
+CEG,Utilities
+CRDO,Information Technology
+CRWD,Information Technology
+DDOG,Information Technology
+DNA,Health Care
+EH,Industrials
+FLNC,Industrials
+GOOG,Communication Services
+GOOGL,Communication Services
+GRAL,Health Care
+HIMS,Health Care
+INTU,Information Technology
+IONQ,Information Technology
+JOBY,Industrials
+MBLY,Information Technology
+MDB,Information Technology
+MELI,Consumer Discretionary
+META,Communication Services
+MRVL,Information Technology
+MSFT,Information Technology
+MU,Information Technology
+NFLX,Communication Services
+NVDA,Information Technology
+ON,Information Technology
+OUST,Information Technology
+PANW,Information Technology
+PLTR,Information Technology
+QBTS,Information Technology
+QCOM,Information Technology
+QS,Industrials
+RGTI,Information Technology
+S,Information Technology
+SDGR,Health Care
+SLDP,Industrials
+SNPS,Information Technology
+STEM,Industrials
+SYM,Industrials
+TEM,Health Care
+TLX,Health Care
+TSLA,Consumer Discretionary
+TSM,Information Technology
+VKTX,Health Care
 XEL,Utilities
-ZS,Cybersecurity
+ZS,Information Technology
