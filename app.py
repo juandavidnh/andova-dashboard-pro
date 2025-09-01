@@ -32,10 +32,7 @@ def to_index_tz(ts, index: pd.DatetimeIndex) -> pd.Timestamp:
 # --------------------------
 @st.cache_data(show_spinner=False, ttl=20)
 def yahoo_market_state(symbol: str = "QQQ") -> str:
-    """
-    Devuelve 'REGULAR' | 'PRE' | 'POST' | 'CLOSED' desde Quote.
-    Usamos una sola fuente de verdad para evitar errores en feriados.
-    """
+    """'REGULAR' | 'PRE' | 'POST' | 'CLOSED' desde Yahoo Quote."""
     try:
         url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={symbol}"
         r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=6)
@@ -49,6 +46,7 @@ def yahoo_market_state(symbol: str = "QQQ") -> str:
 
 @st.cache_data(ttl=10, show_spinner=False)
 def yahoo_intraday_last(symbol: str):
+    """Último precio 1m (incluye pre/post)."""
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=1d&interval=1m&includePrePost=true"
     try:
         r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=7)
@@ -69,6 +67,7 @@ def yahoo_intraday_last(symbol: str):
 
 @st.cache_data(ttl=5, show_spinner=False)
 def yahoo_batch_quotes(symbols: List[str]) -> Tuple[Dict[str, float], Dict[str, float], Dict[str, Optional[pd.Timestamp]]]:
+    """Precios y previousClose por batch; fallback a 1m para los que falten."""
     prices, prev_closes, ts_map = {}, {}, {}
     if not symbols: return prices, prev_closes, ts_map
     chunk = 40; missing=set()
@@ -103,15 +102,8 @@ def yahoo_batch_quotes(symbols: List[str]) -> Tuple[Dict[str, float], Dict[str, 
     return prices, prev_closes, ts_map
 
 # --------------------------
-# Datos y precios
+# Descarga de precios (Yahoo REST v8, sin yfinance)
 # --------------------------
-@st.cache_data(show_spinner=False, ttl=3600)
-def load_weights(path: str = "weights.csv") -> pd.Series:
-    df = pd.read_csv(path)
-    s = pd.Series(df["weight_pct"].values, index=df["ticker"].values).astype(float)
-    s = s[s > 0]
-    return s / s.sum()
-
 @st.cache_data(show_spinner=True, ttl=600)
 def download_prices(tickers: List[str], start, end) -> pd.DataFrame:
     def yahoo_chart_daily_series(ticker: str, start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> pd.DataFrame | None:
@@ -153,6 +145,19 @@ def download_prices(tickers: List[str], start, end) -> pd.DataFrame:
     if failed: st.sidebar.warning("Sin datos tras reintentos (Yahoo REST): " + ", ".join(sorted(failed)))
     return prices
 
+# --------------------------
+# Pesos y sectores
+# --------------------------
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_weights(path: str = "weights.csv") -> pd.Series:
+    df = pd.read_csv(path)
+    s = pd.Series(df["weight_pct"].values, index=df["ticker"].values).astype(float)
+    s = s[s > 0]
+    return s / s.sum()
+
+# --------------------------
+# Rebalanceo (15 y último hábil, al CIERRE del propio día)
+# --------------------------
 def first_trading_on_or_after(index: pd.DatetimeIndex, target: pd.Timestamp):
     i = index.searchsorted(target)
     return index[i] if i < len(index) else None
@@ -160,7 +165,7 @@ def first_trading_on_or_after(index: pd.DatetimeIndex, target: pd.Timestamp):
 def rebalance_dates_semimonthly(prices: pd.DataFrame) -> set:
     idx = prices.index
     if len(idx) == 0: return set()
-    rdates = set(prices.resample("M").last().index)
+    rdates = set(prices.resample("ME").last().index)  # month-end
     months = pd.period_range(idx[0], idx[-1], freq="M")
     for p in months:
         fifteenth = pd.Timestamp(p.year, p.month, 15)
@@ -170,9 +175,6 @@ def rebalance_dates_semimonthly(prices: pd.DataFrame) -> set:
             rdates.add(cand)
     return rdates
 
-# --------------------------
-# Simulación (rebalanceo al CIERRE DEL MISMO DÍA)
-# --------------------------
 def simulate_with_holdings_from_start(prices: pd.DataFrame, weights: pd.Series, start_value: float = 1.0):
     tickers_avail = [t for t in weights.index if t in prices.columns]
     if not tickers_avail: raise ValueError("No hay tickers disponibles.")
@@ -197,14 +199,11 @@ def simulate_with_holdings_from_start(prices: pd.DataFrame, weights: pd.Series, 
 
     pv_list, shares_rows = [], []
     for d in dates:
-        # PV al cierre de d con las shares vigentes DURANTE el día d
-        v = float(np.dot(shares, P.loc[d].values))
-        # Rebalanceamos al CIERRE de d: nuevas shares aplican desde ya (después del cierre)
-        if d in rdates:
-            shares = (v * w / P.loc[d]).values
+        v = float(np.dot(shares, P.loc[d].values))      # PV al cierre de d con shares vigentes
+        if d in rdates:                                  # rebalanceo AL CIERRE de d
+            shares = (v * w / P.loc[d]).values          # nuevas shares desde ya (cierre de d)
         pv_list.append(v)
-        # Guardamos shares POST-rebalanceo del propio día d
-        shares_rows.append(pd.Series(shares, index=P.columns, name=d))
+        shares_rows.append(pd.Series(shares, index=P.columns, name=d))  # shares post-rebalanceo
 
     pv_raw = pd.Series(pv_list, index=dates, name="pv_raw")
     shares_df = pd.DataFrame(shares_rows)
@@ -221,11 +220,6 @@ def normalize_to_anchor(pv_raw: pd.Series, anchor_date: pd.Timestamp, anchor_val
 # Estado de mercado (feriados fijos a CLOSED)
 # --------------------------
 def market_state(P_aligned: pd.DataFrame) -> str:
-    """
-    Usa Yahoo marketState como fuente de verdad:
-    - REGULAR o POST -> 'open'   (permitimos live)
-    - PRE o CLOSED   -> 'preopen' (usar cierres)
-    """
     ms = yahoo_market_state("QQQ")
     if ms in ("REGULAR", "POST"):
         return "open"
@@ -254,7 +248,6 @@ def latest_price_vectors(P_aligned: pd.DataFrame):
             if pd.isna(yday_close.get(t)): yday_close[t]=pc
         pp_used = yday_close
     else:
-        # preopen/feriado: usa el cierre del último hábil
         lp_used=yday_close; pp_used=yday_close
         ts_common = pd.Timestamp.combine(pd.Timestamp(yday_close.name), pd.Timestamp('16:00').time())
         for t in symbols: used[t]="DailyClose"; ts_map[t]=ts_common
@@ -280,7 +273,7 @@ refresh_sec = st.sidebar.number_input("Auto-refresh (segundos)", min_value=5, ma
 
 weights_sel = (weights.loc[selected] if selected else weights).copy()
 weights_sel = weights_sel / weights_sel.sum()
-st.sidebar.dataframe(pd.DataFrame({"weight": weights_sel}).style.format({"weight":"{:.2%}"}), use_container_width=True)
+st.sidebar.dataframe(pd.DataFrame({"weight": weights_sel}).style.format({"weight":"{:.2%}"}), width="stretch")
 
 prices = download_prices(list(weights_sel.index), start, end)
 if prices is None or prices.empty:
@@ -315,7 +308,7 @@ try:
 
     lp_used, pp_used, used_live, mkt_state, ts_map = latest_price_vectors(P_aligned)
 
-    # Para métricas del día: las shares vigentes DURANTE el día t son las del día anterior (porque guardamos post-rebalanceo)
+    # Shares vigentes DURANTE el día t = shares post-rebalanceo del día anterior
     shares_during = shares_df.shift(1)
 
     last_idx = P_aligned.index[-1]
@@ -326,7 +319,6 @@ try:
         prev_val = float(np.dot(last_shares_for_today.values, pp_used.values)) * scale_k
         if prev_val: delta_str = f"{((last_val/prev_val)-1.0)*100.0:.2f}%"
 
-    # Etiqueta LIVE / feriado
     ms = yahoo_market_state("QQQ")
     weekday = datetime.now(US_EASTERN).weekday()
     live_badge = ""
@@ -401,8 +393,6 @@ try:
     chart_df = pv_disp.rename("Índice").to_frame(); fig = px.area(chart_df, x=chart_df.index, y="Índice")
     fig.update_traces(line_color=color, fillcolor=color, opacity=0.25); fig.update_layout(margin=dict(l=0,r=0,t=10,b=0), showlegend=False, xaxis_title="", yaxis_title="")
     st.plotly_chart(fig, use_container_width=True)
-    if range_delta_abs is not None:
-        sign="▲" if range_delta_abs>=0 else "▼"; st.caption(f"{sign} {range_delta_abs:,.2f} puntos ({range_delta_pct:.2f}%) en {sel}{' • LIVE' if (live_on and mkt_state=='open') else ''}")
 
     tab1, tab2, tab3, tab4 = st.tabs(["Métricas","Exposición","Datos","Breakdown"])
 
@@ -421,7 +411,7 @@ try:
              "Vol anual": f"{stats['Vol anual']:.2%}" if pd.notna(stats['Vol anual']) else "n/a",
              "Max DD": f"{stats['Max DD']:.2%}" if pd.notna(stats['Max DD']) else "n/a",
              "Sharpe~": f"{stats['Sharpe~']:.2f}" if pd.notna(stats['Sharpe~']) else "n/a"}
-        st.dataframe(pd.DataFrame(fmt, index=["Índice"]).T, use_container_width=True)
+        st.dataframe(pd.DataFrame(fmt, index=["Índice"]).T, width="stretch")
 
     # ----- Exposición por sector -----
     with tab2:
@@ -432,13 +422,16 @@ try:
             if "ticker" in df.columns: df["ticker"]=df["ticker"].astype(str).str.strip().str.upper()
             if "sector" in df.columns: df["sector"]=df["sector"].fillna("").astype(str).str.strip()
             return df.drop_duplicates(subset=["ticker"], keep="first")
-        sec = sectors.copy() if "sectors" in globals() else pd.DataFrame(columns=["ticker","sector"])
+        try:
+            sec = pd.read_csv("sectors.csv")
+        except Exception:
+            sec = pd.DataFrame(columns=["ticker","sector"])
         sec = _clean_secs_df(sec)
         expos = pd.DataFrame({"ticker":[t.strip().upper() for t in weights_sel.index], "weight":weights_sel.values})
         out = expos.merge(sec, on="ticker", how="left"); out["sector"]=out["sector"].fillna("").replace("","Unknown")
         expos2=out.groupby("sector", as_index=False)["weight"].sum().sort_values("weight", ascending=False)
         fig2=px.bar(expos2, x="sector", y="weight", labels={"weight":"Peso"}); st.plotly_chart(fig2, use_container_width=True)
-        st.dataframe(expos2.style.format({"weight":"{:.2%}"}), use_container_width=True)
+        st.dataframe(expos2.style.format({"weight":"{:.2%}"}), width="stretch")
 
     # ----- Datos base -----
     with tab3:
@@ -446,7 +439,7 @@ try:
         P_show=P_aligned.ffill().copy()
         if live_on and mkt_state=="open":
             now_idx2 = to_index_tz(datetime.now(US_EASTERN), P_show.index); P_show.loc[now_idx2]=lp_used; P_show=P_show.sort_index()
-        st.dataframe(P_show.tail(200), use_container_width=True)
+        st.dataframe(P_show.tail(200), width="stretch")
         st.download_button("Descargar precios CSV", data=P_show.to_csv().encode("utf-8"), file_name="prices.csv", mime="text/csv")
         out_idx = pd.DataFrame({"pv_normalizada": pv})
         st.download_button("Descargar índice CSV", data=out_idx.to_csv().encode("utf-8"), file_name="index_values.csv", mime="text/csv")
@@ -480,7 +473,7 @@ try:
             st.dataframe(last_day_df.style.format({
                 "precio_prev":"{:.2f}","precio_ult":"{:.2f}","ret_%":"{:.2f}%",
                 "contrib_abs_puntos":"{:.2f}","contrib_%_del_mov_indice":"{:.2f}%","peso_actual":"{:.2f}%"
-            }), use_container_width=True)
+            }), width="stretch")
             fig_ld=px.bar(last_day_df.reset_index().rename(columns={"index":"ticker"}), x="ticker", y="contrib_abs_puntos", title="Contribución absoluta (puntos) — último día/snapshot")
             st.plotly_chart(fig_ld, use_container_width=True)
         else:
@@ -526,7 +519,7 @@ try:
                 st.dataframe(range_df.style.format({
                     "ret_%_rango":"{:.2f}%","contrib_abs_puntos":"{:.2f}",
                     "contrib_%_del_mov_indice":"{:.2f}%","peso_actual_fin_rango":"{:.2f}%"
-                }), use_container_width=True)
+                }), width="stretch")
                 fig_rg=px.bar(range_df.reset_index().rename(columns={"index":"ticker"}), x="ticker", y="contrib_abs_puntos", title="Contribución absoluta (puntos) — rango")
                 st.plotly_chart(fig_rg, use_container_width=True)
 
