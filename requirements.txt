@@ -1,8 +1,6 @@
-numpy>=1.26
-pandas>=2.1
-plotly>=5.22
-pytz
-requests>=2.31
-streamlit>=1.38.0
-yfinance>=0.2.40
-streamlit-autorefresh
+streamlit>=1.37.0
+yfinance>=0.2.52
+pandas>=2.1.0
+numpy>=1.26.0
+pandas_market_calendars>=4.4.0
+plotly>=5.22.0
