@@ -1,1 +1,1 @@
-v6 — + métricas diarias arriba (Índice vs QQQ)
+v6-fresh — prices fetched on every rerun (no cache) + force refresh button

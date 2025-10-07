@@ -52,7 +52,6 @@ if "events" not in st.session_state:
 st.session_state.events[ANCHOR_DATE] = initial_weights
 save_events(st.session_state.events)
 
-@st.cache_data(show_spinner=False)
 def fetch_prices(tickers, start, end):
     if isinstance(tickers, (list, tuple, set)):
         tickers = list(dict.fromkeys([t.strip().upper() for t in tickers if str(t).strip() != ""]))
@@ -162,6 +161,10 @@ def compute_window(preset_key: str, end_date: pd.Timestamp, custom_start: pd.Tim
     return start_ts, end_ts
 
 win_start, win_end = compute_window(preset, date_end, date_start_custom)
+
+st.sidebar.button("Force refresh now", on_click=lambda: st.experimental_rerun())
+st.sidebar.caption("Prices are fetched fresh on each page refresh.")
+
 
 # Carga CSVs de recomposición
 with st.sidebar.expander("Recomposiciones (múltiples)", expanded=False):
