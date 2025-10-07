@@ -250,6 +250,25 @@ if not qqq.empty:
 else:
     qqq_idx = pd.Series(dtype=float, name="QQQ (base 1000)")
 
+# --- Métricas diarias arriba (Índice vs QQQ) ---
+with st.container():
+    c1, c2, c3 = st.columns([2,1,1])
+    c1.subheader("Resumen diario")
+    idx_change, qqq_change = np.nan, np.nan
+    if not pv_all.empty:
+        # Rebase a 1000 en el primer punto >= ancla
+        if (pv_all.index >= ANCHOR_DATE).any():
+            base_val = float(pv_all.loc[pv_all.index >= ANCHOR_DATE].iloc[0])
+            pv1000 = pv_all * (1000.0 / base_val)
+        else:
+            pv1000 = pv_all
+        if pv1000.size >= 2:
+            idx_change = float(pv1000.iloc[-1]/pv1000.iloc[-2]-1)
+    if not qqq_idx.empty and qqq_idx.size >= 2:
+        qqq_change = float(qqq_idx.iloc[-1]/qqq_idx.iloc[-2]-1)
+    c2.metric("Índice — cambio hoy", f"{(0 if np.isnan(idx_change) else idx_change)*100:,.2f}%")
+    c3.metric("QQQ — cambio hoy", f"{(0 if np.isnan(qqq_change) else qqq_change)*100:,.2f}%")
+
 # --- Gráfico ---
 st.subheader("Curva del índice (con backtrack) vs QQQ")
 if pv_all.empty:
